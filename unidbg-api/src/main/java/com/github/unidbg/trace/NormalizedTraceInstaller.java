@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -49,6 +50,10 @@ public final class NormalizedTraceInstaller {
     private static final class TraceCodeHook implements CodeHook {
         private final NormalizedTraceSession session;
         private final NormalizedTraceModuleResolver resolver;
+        private final CachedInstruction[] instructionCache = new CachedInstruction[8192];
+        private final Map<Long, CachedInstruction> overflowInstructionCache = new HashMap<>();
+        private long svcMemoryBase = -1;
+        private long svcMemoryEnd = -1;
         private UnHook unHook;
 
         private TraceCodeHook(NormalizedTraceSession session) {
@@ -66,34 +71,90 @@ public final class NormalizedTraceInstaller {
             if (previous != null) {
                 previous.flush(session.writer(), currentRegisters);
             }
+            if (isSvcMemory(address)) {
+                session.pendingInstruction(null);
+                session.stopIfNeeded();
+                return;
+            }
             session.pendingInstruction(buildPendingInstruction(backend, address, size, currentRegisters));
             session.stopIfNeeded();
         }
 
+        private boolean isSvcMemory(long address) {
+            if (svcMemoryBase == -1) {
+                try {
+                    com.github.unidbg.memory.SvcMemory svcMemory = session.emulator().getSvcMemory();
+                    if (svcMemory == null) {
+                        svcMemoryBase = -2;
+                    } else {
+                        svcMemoryBase = svcMemory.getBase();
+                        svcMemoryEnd = svcMemoryBase + svcMemory.getSize();
+                    }
+                } catch (RuntimeException ignored) {
+                    svcMemoryBase = -2;
+                }
+            }
+            return svcMemoryBase > 0 && address >= svcMemoryBase && address < svcMemoryEnd;
+        }
+
         private PendingInstruction buildPendingInstruction(Backend backend, long address, int size, Map<String, String> beforeRegisters) {
             NormalizedTraceConfig config = session.config();
-            byte[] bytes = readBytes(backend, address, size);
-            Instruction instruction = decodeInstruction(address, bytes);
+            CachedInstruction instruction = cachedInstruction(backend, address, size);
             Map<String, Object> event = new LinkedHashMap<>();
             event.put("thread_id", "main");
             event.put("kind", "instruction");
             event.put("pc", NormalizedTraceModuleResolver.hex(address));
             resolver.putModuleFields(event, address);
             Map<String, Object> instructionJson = new LinkedHashMap<>();
-            instructionJson.put("bytes", config.includeInstructionBytes ? Hex.encodeHexString(bytes) : "");
-            instructionJson.put("mnemonic", instruction == null ? "unknown" : safeString(instruction.getMnemonic(), "unknown"));
-            instructionJson.put("operands", instruction == null ? Collections.emptyList() : operands(instruction));
+            instructionJson.put("bytes", config.includeInstructionBytes ? instruction.bytesHex : "");
+            instructionJson.put("mnemonic", instruction.mnemonic);
+            instructionJson.put("operands", instruction.operands);
             event.put("instruction", instructionJson);
             event.put("memory", Collections.emptyList());
-            event.put("branch", branch(address, size, instruction));
+            event.put("branch", instruction.branch);
             Map<String, Object> backendJson = new LinkedHashMap<>();
             backendJson.put("name", config.backendName);
             backendJson.put("raw_kind", "code_hook");
             event.put("backend", backendJson);
-            Map<String, String> reads = config.includeRegisterReads && instruction != null
-                    ? NormalizedTraceRegisters.reads(session.emulator(), backend, instruction, beforeRegisters)
+            Map<String, String> reads = config.includeRegisterReads && instruction.rawInstruction != null
+                    ? NormalizedTraceRegisters.reads(session.emulator(), backend, instruction.rawInstruction, beforeRegisters)
                     : Collections.emptyMap();
             return new PendingInstruction(event, beforeRegisters, reads);
+        }
+
+        private CachedInstruction cachedInstruction(Backend backend, long address, int size) {
+            int slot = (int) ((address >>> 2) & (instructionCache.length - 1));
+            CachedInstruction cached = instructionCache[slot];
+            if (cached != null && cached.address == address && cached.size == size) {
+                return cached;
+            }
+            cached = overflowInstructionCache.get(address);
+            if (cached != null && cached.size == size) {
+                return cached;
+            }
+            CachedInstruction decoded = decodeCachedInstruction(backend, address, size);
+            CachedInstruction old = instructionCache[slot];
+            if (old != null && old.address != address) {
+                overflowInstructionCache.put(old.address, old);
+            }
+            instructionCache[slot] = decoded;
+            overflowInstructionCache.put(address, decoded);
+            return decoded;
+        }
+
+        private CachedInstruction decodeCachedInstruction(Backend backend, long address, int size) {
+            byte[] bytes = readBytes(backend, address, size);
+            Instruction rawInstruction = decodeInstruction(address, bytes);
+            String mnemonic = rawInstruction == null ? "unknown" : safeString(rawInstruction.getMnemonic(), "unknown");
+            List<String> operands = rawInstruction == null ? Collections.emptyList() : operands(rawInstruction);
+            return new CachedInstruction(
+                    address,
+                    size,
+                    Hex.encodeHexString(bytes),
+                    mnemonic,
+                    operands,
+                    branch(address, size, rawInstruction),
+                    rawInstruction);
         }
 
         private byte[] readBytes(Backend backend, long address, int size) {
@@ -148,6 +209,26 @@ public final class NormalizedTraceInstaller {
             return branch;
         }
 
+        private static final class CachedInstruction {
+            private final long address;
+            private final int size;
+            private final String bytesHex;
+            private final String mnemonic;
+            private final List<String> operands;
+            private final Map<String, Object> branch;
+            private final Instruction rawInstruction;
+
+            private CachedInstruction(long address, int size, String bytesHex, String mnemonic, List<String> operands, Map<String, Object> branch, Instruction rawInstruction) {
+                this.address = address;
+                this.size = size;
+                this.bytesHex = bytesHex;
+                this.mnemonic = mnemonic;
+                this.operands = operands;
+                this.branch = branch;
+                this.rawInstruction = rawInstruction;
+            }
+        }
+
         private String parseBranchTarget(String opStr) {
             if (opStr == null) {
                 return null;
@@ -196,8 +277,15 @@ public final class NormalizedTraceInstaller {
         }
 
         private void writeMemoryEvent(Backend backend, String kind, String rawKind, String access, long address, int size, Long writeValue) {
+            Map<String, Object> memoryAccess = memoryAccess(backend, access, address, size, writeValue);
+            PendingInstruction pending = session.pendingInstruction();
+            if (pending != null) {
+                pending.addMemoryAccess(memoryAccess);
+                session.writer().recordMemoryAccess(access);
+                return;
+            }
             Map<String, Object> event = baseMemoryEvent(backend, kind, rawKind);
-            event.put("memory", Collections.singletonList(memoryAccess(backend, access, address, size, writeValue)));
+            event.put("memory", Collections.singletonList(memoryAccess));
             session.writer().writeEvent(kind, event);
         }
 

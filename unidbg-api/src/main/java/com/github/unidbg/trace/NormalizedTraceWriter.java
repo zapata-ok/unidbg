@@ -12,14 +12,19 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 
 final class NormalizedTraceWriter implements Closeable {
 
     private final NormalizedTraceConfig config;
     private final File eventFile;
     private final BufferedWriter writer;
+    private final BlockingQueue<String> queue = new ArrayBlockingQueue<>(8192);
+    private final Thread writerThread;
     private final NormalizedTraceCounters counters = new NormalizedTraceCounters();
     private final List<String> diagnostics = new ArrayList<>();
+    private static final String POISON = new String("normalized-trace-writer-poison");
     private long seq;
     private boolean closed;
 
@@ -30,6 +35,14 @@ final class NormalizedTraceWriter implements Closeable {
         }
         this.eventFile = new File(config.outputDir, "events." + config.caseId + ".000.jsonl");
         this.writer = new BufferedWriter(new FileWriter(eventFile));
+        this.writerThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                drainQueue();
+            }
+        }, "NormalizedTraceWriter");
+        this.writerThread.setDaemon(true);
+        this.writerThread.start();
     }
 
     boolean writeEvent(String kind, Map<String, Object> event) {
@@ -44,8 +57,7 @@ final class NormalizedTraceWriter implements Closeable {
         try {
             seq++;
             event.put("seq", seq);
-            writer.write(JSON.toJSONString(event));
-            writer.newLine();
+            enqueue(JSON.toJSONString(event));
             counters.events++;
             if ("instruction".equals(kind)) {
                 counters.instructions++;
@@ -67,10 +79,50 @@ final class NormalizedTraceWriter implements Closeable {
                 counters.branches++;
             }
             return true;
-        } catch (IOException e) {
+        } catch (RuntimeException e) {
             diagnostics.add("write trace event failed: " + e.getMessage());
             counters.droppedEvents++;
             return false;
+        }
+    }
+
+    private void enqueue(String line) {
+        try {
+            queue.put(line);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private void drainQueue() {
+        try {
+            while (true) {
+                String line = queue.take();
+                if (POISON == line) {
+                    break;
+                }
+                writer.write(line);
+                writer.newLine();
+            }
+            writer.flush();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            diagnostics.add("trace writer interrupted");
+        } catch (IOException e) {
+            diagnostics.add("write trace event failed: " + e.getMessage());
+        }
+    }
+
+    void flushEvents() {
+        while (!queue.isEmpty()) {
+            try {
+                Thread.sleep(1L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                diagnostics.add("trace writer flush interrupted");
+                return;
+            }
         }
     }
 
@@ -80,6 +132,14 @@ final class NormalizedTraceWriter implements Closeable {
 
     NormalizedTraceCounters counters() {
         return counters.snapshot();
+    }
+
+    void recordMemoryAccess(String access) {
+        if ("read".equals(access)) {
+            counters.memoryReads++;
+        } else if ("write".equals(access)) {
+            counters.memoryWrites++;
+        }
     }
 
     List<String> diagnostics() {
@@ -100,7 +160,13 @@ final class NormalizedTraceWriter implements Closeable {
             return;
         }
         closed = true;
-        writer.flush();
+        enqueue(POISON);
+        try {
+            writerThread.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("trace writer close interrupted", e);
+        }
         writer.close();
     }
 

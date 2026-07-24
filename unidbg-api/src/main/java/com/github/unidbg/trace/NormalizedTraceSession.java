@@ -87,7 +87,8 @@ public final class NormalizedTraceSession implements Closeable {
             pendingInstruction.flush(writer, null);
             pendingInstruction = null;
         }
-        writer.close();
+        writer.flushEvents();
         writer.writeSessionSummary("closed");
+        writer.close();
     }
 }
