@@ -20,6 +20,7 @@ final class NormalizedTraceWriter implements Closeable {
     private final NormalizedTraceConfig config;
     private final File eventFile;
     private final BufferedWriter writer;
+    private final BinaryTraceWriter binaryWriter;
     private final BlockingQueue<String> queue = new ArrayBlockingQueue<>(8192);
     private final Thread writerThread;
     private final NormalizedTraceCounters counters = new NormalizedTraceCounters();
@@ -33,8 +34,11 @@ final class NormalizedTraceWriter implements Closeable {
         if (!config.outputDir.exists() && !config.outputDir.mkdirs()) {
             throw new IOException("failed to create trace output directory: " + config.outputDir);
         }
+        boolean jsonlEnabled = config.outputFormat == TraceOutputFormat.JSONL || config.outputFormat == TraceOutputFormat.BOTH;
+        boolean binaryEnabled = config.outputFormat == TraceOutputFormat.BINARY || config.outputFormat == TraceOutputFormat.BOTH;
         this.eventFile = new File(config.outputDir, "events." + config.caseId + ".000.jsonl");
-        this.writer = new BufferedWriter(new FileWriter(eventFile));
+        this.writer = jsonlEnabled ? new BufferedWriter(new FileWriter(eventFile)) : null;
+        this.binaryWriter = binaryEnabled ? new BinaryTraceWriter(config) : null;
         this.writerThread = new Thread(new Runnable() {
             @Override
             public void run() {
@@ -42,7 +46,9 @@ final class NormalizedTraceWriter implements Closeable {
             }
         }, "NormalizedTraceWriter");
         this.writerThread.setDaemon(true);
-        this.writerThread.start();
+        if (jsonlEnabled) {
+            this.writerThread.start();
+        }
     }
 
     boolean writeEvent(String kind, Map<String, Object> event) {
@@ -57,7 +63,9 @@ final class NormalizedTraceWriter implements Closeable {
         try {
             seq++;
             event.put("seq", seq);
-            enqueue(JSON.toJSONString(event));
+            if (writer != null) {
+                enqueue(JSON.toJSONString(event));
+            }
             counters.events++;
             if ("instruction".equals(kind)) {
                 counters.instructions++;
@@ -130,15 +138,24 @@ final class NormalizedTraceWriter implements Closeable {
         sb.append('}');
         appendRegisters(sb, instruction, afterRegisters);
         sb.append(",\"seq\":").append(currentSeq).append('}');
-        enqueue(sb.toString());
+        if (writer != null) {
+            enqueue(sb.toString());
+        }
+        try {
+            if (binaryWriter != null) {
+                binaryWriter.writeInstruction(currentSeq, instruction, afterRegisters);
+            }
+        } catch (IOException e) {
+            diagnostics.add("write binary trace event failed: " + e.getMessage());
+            counters.droppedEvents++;
+            return false;
+        }
         counters.events++;
         counters.instructions++;
         if (instruction.instruction.branch != null) {
             counters.branches++;
         }
-        if (hasRegisterWrites(instruction.beforeRegisters, afterRegisters)) {
-            counters.registerWrites++;
-        }
+        counters.registerWrites += countRegisterWrites(instruction.beforeRegisters, afterRegisters);
         return true;
     }
 
@@ -172,7 +189,18 @@ final class NormalizedTraceWriter implements Closeable {
         appendMemoryAccess(sb, access);
         sb.append(']');
         sb.append(",\"seq\":").append(currentSeq).append('}');
-        enqueue(sb.toString());
+        if (writer != null) {
+            enqueue(sb.toString());
+        }
+        try {
+            if (binaryWriter != null) {
+                binaryWriter.writeMemoryEvent(currentSeq, kind, moduleFields, pc, access);
+            }
+        } catch (IOException e) {
+            diagnostics.add("write binary trace event failed: " + e.getMessage());
+            counters.droppedEvents++;
+            return false;
+        }
         counters.events++;
         if ("memory_read".equals(kind)) {
             counters.memoryReads++;
@@ -212,17 +240,18 @@ final class NormalizedTraceWriter implements Closeable {
         sb.append("}}");
     }
 
-    private boolean hasRegisterWrites(NormalizedTraceRegisters.Snapshot before, NormalizedTraceRegisters.Snapshot after) {
+    private int countRegisterWrites(NormalizedTraceRegisters.Snapshot before, NormalizedTraceRegisters.Snapshot after) {
         if (before == null || after == null) {
-            return false;
+            return 0;
         }
+        int count = 0;
         int len = Math.min(before.names.length, after.names.length);
         for (int i = 0; i < len; i++) {
             if (before.valid[i] && after.valid[i] && before.values[i] != after.values[i]) {
-                return true;
+                count++;
             }
         }
-        return false;
+        return count;
     }
 
     private void appendMemoryAccess(StringBuilder sb, MemoryAccess access) {
@@ -244,7 +273,7 @@ final class NormalizedTraceWriter implements Closeable {
         sb.append("\"taken\":").append(branch.taken);
         sb.append(",\"target\":");
         if (branch.target == null) {
-            sb.append("null");
+            appendJsonString(sb, "");
         } else {
             appendJsonString(sb, branch.target);
         }
@@ -321,10 +350,14 @@ final class NormalizedTraceWriter implements Closeable {
                 if (POISON == line) {
                     break;
                 }
-                writer.write(line);
-                writer.newLine();
+                if (writer != null) {
+                    writer.write(line);
+                    writer.newLine();
+                }
             }
-            writer.flush();
+            if (writer != null) {
+                writer.flush();
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             diagnostics.add("trace writer interrupted");
@@ -359,6 +392,9 @@ final class NormalizedTraceWriter implements Closeable {
         } else if ("write".equals(access)) {
             counters.memoryWrites++;
         }
+        if (binaryWriter != null) {
+            binaryWriter.recordMemoryAccess(access);
+        }
     }
 
     List<String> diagnostics() {
@@ -379,14 +415,25 @@ final class NormalizedTraceWriter implements Closeable {
             return;
         }
         closed = true;
-        enqueue(POISON);
-        try {
-            writerThread.join();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("trace writer close interrupted", e);
+        if (writer != null) {
+            enqueue(POISON);
+            try {
+                writerThread.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("trace writer close interrupted", e);
+            }
+            writer.close();
         }
-        writer.close();
+        if (binaryWriter != null) {
+            binaryWriter.close();
+        }
+    }
+
+    void writeBinaryMetadata() throws IOException {
+        if (binaryWriter != null) {
+            binaryWriter.writeMetadata();
+        }
     }
 
     void writeSessionSummary(String status) throws IOException {
@@ -396,13 +443,24 @@ final class NormalizedTraceWriter implements Closeable {
         summary.put("status", status);
         summary.put("case_id", config.caseId);
         List<Map<String, Object>> files = new ArrayList<>();
-        Map<String, Object> file = new LinkedHashMap<>();
-        file.put("path", eventFileName());
-        file.put("format", "jsonl");
-        file.put("event_schema", "trace_event.v0.1");
-        file.put("status", counters.events > 0 ? "collected" : "empty");
-        file.put("compression", "none");
-        files.add(file);
+        if (writer != null) {
+            Map<String, Object> file = new LinkedHashMap<>();
+            file.put("path", eventFileName());
+            file.put("format", "jsonl");
+            file.put("event_schema", "trace_event.v0.1");
+            file.put("status", counters.events > 0 ? "collected" : "empty");
+            file.put("compression", "none");
+            files.add(file);
+        }
+        if (binaryWriter != null) {
+            Map<String, Object> file = new LinkedHashMap<>();
+            file.put("path", binaryWriter.eventFileName());
+            file.put("format", BinaryTraceWriter.FORMAT);
+            file.put("event_schema", "trace_event_binary.v0.1");
+            file.put("status", counters.events > 0 ? "collected" : "empty");
+            file.put("compression", "none");
+            files.add(file);
+        }
         summary.put("event_files", files);
         Map<String, Object> counts = new LinkedHashMap<>();
         counts.put("events", counters.events);

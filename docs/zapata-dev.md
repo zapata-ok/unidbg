@@ -216,10 +216,16 @@ JSONL writer 第一阶段优化：
 - 异步 writer thread 批量落盘。
 - 按 chunk size rotate，避免单文件过大。
 
-Binary writer 后续优化：
+Binary writer v0.1：
 
-- 写 instruction/memory/register typed rows。
-- 写 string table、module table、profile/config metadata。
+- `TraceOutputFormat` 支持 `JSONL`、`BINARY`、`BOTH`。
+- `BINARY` 输出 `trace.<case_id>.000.bin`，格式名为 `zapata-trace-bin-v0.1`。
+- 文件头写 `ZTRC` magic、version、backend、case_id。
+- event record 写 instruction/memory typed rows。
+- instruction record 覆盖 pc、module、file_offset、symbol、instruction bytes、mnemonic、operands、branch target、register writes、memory accesses。
+- memory record 覆盖 pc、module、file_offset、access kind、address、size、value bytes。
+- 当前 v0.1 为 append-only typed chunks；string table、module table 和 chunk rotation 后续再做，不进入热路径契约破坏。
+- `BOTH` 用于 parity gate：JSONL 保持 debug/audit，binary 作为 VMP-Lift `trace.db` ingestion 优先输入。
 - 输出仍是 trace artifact，由 VMP-Lift ingestion 编译成 `trace.db`。
 
 ## 11. Symbol / Call Semantic
@@ -249,7 +255,8 @@ unidbg session 输出：
 
 ```text
 events.<case_id>.<chunk>.jsonl       # debug/audit profile
-trace.<case_id>.<chunk>.bin          # DB_HOT profile, future
+trace.<case_id>.<chunk>.bin          # ztrace binary artifact
+trace.<case_id>.meta.json            # binary artifact metadata
 normalized_trace_session.json
 ```
 

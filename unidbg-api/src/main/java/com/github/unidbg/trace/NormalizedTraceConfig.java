@@ -36,6 +36,7 @@ public final class NormalizedTraceConfig {
     public final String backendName;
     public final Level level;
     public final Profile profile;
+    public final TraceOutputFormat outputFormat;
     public final long maxEvents;
     public final long maxEventFileBytes;
     public final Module targetModule;
@@ -60,6 +61,7 @@ public final class NormalizedTraceConfig {
         this.backendName = builder.backendName;
         this.level = builder.level;
         this.profile = builder.profile;
+        this.outputFormat = builder.outputFormat;
         this.maxEvents = builder.maxEvents;
         this.maxEventFileBytes = builder.maxEventFileBytes;
         this.targetModule = builder.targetModule;
@@ -177,6 +179,7 @@ public final class NormalizedTraceConfig {
         private String backendName = "unidbg";
         private Level level = Level.INSTRUCTION;
         private Profile profile = Profile.DEFAULT;
+        private TraceOutputFormat outputFormat = TraceOutputFormat.JSONL;
         private long maxEvents = 1_000_000L;
         private long maxEventFileBytes = 0L;
         private Module targetModule;
@@ -236,6 +239,11 @@ public final class NormalizedTraceConfig {
                 this.includeRegisterWrites = false;
                 this.includeRegisterReads = false;
             }
+            return this;
+        }
+
+        public Builder outputFormat(TraceOutputFormat outputFormat) {
+            this.outputFormat = outputFormat;
             return this;
         }
 
@@ -330,6 +338,9 @@ public final class NormalizedTraceConfig {
             }
             if (profile == null) {
                 profile = Profile.DEFAULT;
+            }
+            if (outputFormat == null) {
+                outputFormat = TraceOutputFormat.JSONL;
             }
             if (selectedRegisters == null) {
                 selectedRegisters = arm64GprAll();
