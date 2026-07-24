@@ -228,6 +228,24 @@ Binary writer v0.1：
 - `BOTH` 用于 parity gate：JSONL 保持 debug/audit，binary 作为 VMP-Lift `trace.db` ingestion 优先输入。
 - 输出仍是 trace artifact，由 VMP-Lift ingestion 编译成 `trace.db`。
 
+Binary writer v0.2：
+
+- 格式名为 `zapata-trace-bin-v0.2`，文件名为 `trace.<case_id>.<chunk>.bin`。
+- 支持按 `maxEventFileBytes` / `maxEvents` chunk rotation；runner 在 `trace_corpus.json` 中为每个 chunk 输出一条 `trace_files` 记录。
+- 每个 chunk 独立携带 string table、module table、register table，避免后续 chunk 的 interned strings 污染已关闭 chunk。
+- event record 中 module、symbol、mnemonic、operand、instruction bytes、register name 使用 table id，减少重复字符串落盘。
+- header 包含 magic/version/chunk index、event counters、event/table offsets、file size、CRC32 字段和 reserved 字段；VMP-Lift importer 会校验 magic/version、file size 和 offset 单调性。
+- memory value 长度使用 32-bit signed length，`-1` 表示无 value；register writes 使用 register id + u64 value。
+- `trace.<case_id>.meta.json` 汇总所有 chunks 的 event count、bytes、checksum 和全局 counters。
+- `DB_HOT` / 大规模 `full` trace 默认应走 binary artifact；JSONL 保留为 audit/debug 和 `BOTH` parity gate。
+
+当前回归数据：
+
+- `pbkdf2_sha256` full binary v0.2：`904787` events、`904753` instructions、`91491` branches、`317128` memory reads、`145517` memory writes、`1527865` register writes。
+- 单 chunk binary v0.2 文件约 `82.6MB`；同一 case 的 v0.1 binary 曾约 `133.7MB`。
+- VMP-Lift `trace db-build` 已能从 v0.2 binary 构建 `trace.db`，rows=`904787`，diagnostics=[]。
+- rotation smoke：`max-events=5000`、`max-event-file-bytes=200000` 生成 3 个 v0.2 chunks，VMP-Lift db-build rows=`5000`。
+
 ## 11. Symbol / Call Semantic
 
 symbol 和 call semantic 有价值，但默认不能拖慢 VMP hot trace。

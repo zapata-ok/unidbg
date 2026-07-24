@@ -454,9 +454,13 @@ final class NormalizedTraceWriter implements Closeable {
         }
         if (binaryWriter != null) {
             Map<String, Object> file = new LinkedHashMap<>();
-            file.put("path", binaryWriter.eventFileName());
+            if (binaryWriter.eventFileNames().size() <= 1) {
+                file.put("path", binaryWriter.eventFileName());
+            } else {
+                file.put("paths", binaryWriter.eventFileNames());
+            }
             file.put("format", BinaryTraceWriter.FORMAT);
-            file.put("event_schema", "trace_event_binary.v0.1");
+            file.put("event_schema", "trace_event_binary.v0.2");
             file.put("status", counters.events > 0 ? "collected" : "empty");
             file.put("compression", "none");
             files.add(file);
