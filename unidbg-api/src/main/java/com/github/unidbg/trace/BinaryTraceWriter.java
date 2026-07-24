@@ -90,26 +90,26 @@ final class BinaryTraceWriter implements Closeable {
         chunk.out.writeByte(EVENT_INSTRUCTION);
         chunk.out.writeLong(seq);
         chunk.out.writeLong(instruction.pc);
-        chunk.out.writeInt((int) moduleId);
+        writeVarUInt(chunk, moduleId);
         chunk.out.writeLong(parseHexOrZero(instruction.moduleFields.fileOffset));
-        chunk.out.writeInt((int) symbolId);
-        chunk.out.writeInt((int) bytesId);
-        chunk.out.writeInt((int) mnemonicId);
-        chunk.out.writeShort(operandIds.size());
+        writeVarUInt(chunk, symbolId);
+        writeVarUInt(chunk, bytesId);
+        writeVarUInt(chunk, mnemonicId);
+        writeVarUInt(chunk, operandIds.size());
         for (Integer operandId : operandIds) {
-            chunk.out.writeInt(operandId);
+            writeVarUInt(chunk, operandId);
         }
         if (instruction.instruction.branch == null) {
             chunk.out.writeByte(0);
         } else {
             chunk.out.writeByte(1);
             chunk.out.writeByte(instruction.instruction.branch.taken ? 1 : 0);
-            chunk.out.writeInt((int) chunk.internStringId(instruction.instruction.branch.target));
-            chunk.out.writeInt((int) chunk.internStringId(instruction.instruction.branch.fallthrough));
+            writeVarUInt(chunk, chunk.internStringId(instruction.instruction.branch.target));
+            writeVarUInt(chunk, chunk.internStringId(instruction.instruction.branch.fallthrough));
         }
 
         int registerWriteCount = writeRegisterWrites(chunk, instruction.beforeRegisters, afterRegisters);
-        chunk.out.writeShort(instruction.memoryAccesses.size());
+        writeVarUInt(chunk, instruction.memoryAccesses.size());
         for (MemoryAccess access : instruction.memoryAccesses) {
             writeMemoryAccess(chunk, access);
         }
@@ -147,9 +147,9 @@ final class BinaryTraceWriter implements Closeable {
         chunk.out.writeByte("memory_write".equals(kind) ? EVENT_MEMORY_WRITE : EVENT_MEMORY_READ);
         chunk.out.writeLong(seq);
         chunk.out.writeLong(pc);
-        chunk.out.writeInt((int) moduleId);
+        writeVarUInt(chunk, moduleId);
         chunk.out.writeLong(parseHexOrZero(moduleFields == null ? null : moduleFields.fileOffset));
-        chunk.out.writeInt((int) symbolId);
+        writeVarUInt(chunk, symbolId);
         writeMemoryAccess(chunk, access);
 
         chunk.finishEvent();
@@ -257,7 +257,7 @@ final class BinaryTraceWriter implements Closeable {
 
     private int writeRegisterWrites(Chunk chunk, NormalizedTraceRegisters.Snapshot before, NormalizedTraceRegisters.Snapshot after) throws IOException {
         if (before == null || after == null) {
-            chunk.out.writeShort(0);
+            writeVarUInt(chunk, 0);
             return 0;
         }
         int len = Math.min(before.names.length, after.names.length);
@@ -267,13 +267,13 @@ final class BinaryTraceWriter implements Closeable {
                 count++;
             }
         }
-        chunk.out.writeShort(count);
+        writeVarUInt(chunk, count);
         for (int i = 0; i < len; i++) {
             if (!before.valid[i] || !after.valid[i] || before.values[i] == after.values[i]) {
                 continue;
             }
             int regId = registerIds.getOrDefault(after.names[i], 0);
-            chunk.out.writeInt(regId);
+            writeVarUInt(chunk, regId);
             chunk.out.writeLong(after.values[i]);
         }
         return count;
@@ -296,28 +296,35 @@ final class BinaryTraceWriter implements Closeable {
     private void writeMemoryAccess(Chunk chunk, MemoryAccess access) throws IOException {
         chunk.out.writeByte("write".equals(access.access) ? 2 : 1);
         chunk.out.writeLong(access.address);
-        chunk.out.writeInt(access.size);
+        writeVarUInt(chunk, access.size);
         if (access.valueHex == null) {
-            chunk.out.writeInt(-1);
+            writeVarUInt(chunk, 0);
         } else {
             byte[] bytes = hexToBytes(access.valueHex);
-            chunk.out.writeInt(bytes.length);
+            writeVarUInt(chunk, bytes.length + 1L);
             chunk.out.write(bytes);
         }
     }
 
+    private void writeVarUInt(Chunk chunk, long value) throws IOException {
+        while ((value & ~0x7fL) != 0) {
+            chunk.out.writeByte((int) ((value & 0x7fL) | 0x80L));
+            value >>>= 7;
+        }
+        chunk.out.writeByte((int) value);
+    }
+
     private long estimateInstructionBytes(PendingInstruction instruction, NormalizedTraceRegisters.Snapshot afterRegisters) {
-        long bytes = 1 + 8 + 8 + 4 + 8 + 4 + 4 + 4 + 2;
-        bytes += 4L * instruction.instruction.operands.size();
-        bytes += 2;
+        long bytes = 1 + 8 + 8 + 2 + 8 + 2 + 2 + 2 + 1;
+        bytes += 2L * instruction.instruction.operands.size();
+        bytes += 1;
         if (instruction.instruction.branch != null) {
-            bytes += 1 + 4 + 4;
+            bytes += 1 + 2 + 2;
         }
-        bytes += 2;
         if (beforeHasRegisters(instruction.beforeRegisters, afterRegisters)) {
-            bytes += 12L * countRegisterWrites(instruction.beforeRegisters, afterRegisters);
+            bytes += 9L * countRegisterWrites(instruction.beforeRegisters, afterRegisters);
         }
-        bytes += 2;
+        bytes += 1;
         for (MemoryAccess access : instruction.memoryAccesses) {
             bytes += estimateMemoryBytes(access);
         }
@@ -325,7 +332,7 @@ final class BinaryTraceWriter implements Closeable {
     }
 
     private long estimateMemoryBytes(MemoryAccess access) {
-        return 1 + 8 + 4 + 4 + 4 + (access.valueHex == null ? 0 : access.valueHex.length() / 2);
+        return 1 + 8 + 2 + 1 + (access.valueHex == null ? 0 : access.valueHex.length() / 2);
     }
 
     private boolean beforeHasRegisters(NormalizedTraceRegisters.Snapshot before, NormalizedTraceRegisters.Snapshot after) {

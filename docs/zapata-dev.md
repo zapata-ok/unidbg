@@ -234,17 +234,19 @@ Binary writer v0.2：
 - 支持按 `maxEventFileBytes` / `maxEvents` chunk rotation；runner 在 `trace_corpus.json` 中为每个 chunk 输出一条 `trace_files` 记录。
 - 每个 chunk 独立携带 string table、module table、register table，避免后续 chunk 的 interned strings 污染已关闭 chunk。
 - event record 中 module、symbol、mnemonic、operand、instruction bytes、register name 使用 table id，减少重复字符串落盘。
+- v0.2 event 热路径使用 varuint 收紧 table id、operand count、register count、memory count、memory size 和 memory value length；PC、address、register value 仍使用 64-bit 固定宽字段。
 - header 包含 magic/version/chunk index、event counters、event/table offsets、file size、CRC32 字段和 reserved 字段；VMP-Lift importer 会校验 magic/version、file size 和 offset 单调性。
-- memory value 长度使用 32-bit signed length，`-1` 表示无 value；register writes 使用 register id + u64 value。
+- memory value length 使用 `len + 1` varuint，`0` 表示无 value；register writes 使用 varuint register id + u64 value。
 - `trace.<case_id>.meta.json` 汇总所有 chunks 的 event count、bytes、checksum 和全局 counters。
 - `DB_HOT` / 大规模 `full` trace 默认应走 binary artifact；JSONL 保留为 audit/debug 和 `BOTH` parity gate。
 
 当前回归数据：
 
 - `pbkdf2_sha256` full binary v0.2：`904787` events、`904753` instructions、`91491` branches、`317128` memory reads、`145517` memory writes、`1527865` register writes。
-- 单 chunk binary v0.2 文件约 `82.6MB`；同一 case 的 v0.1 binary 曾约 `133.7MB`。
-- VMP-Lift `trace db-build` 已能从 v0.2 binary 构建 `trace.db`，rows=`904787`，diagnostics=[]。
+- 单 chunk binary v0.2 固定宽版本约 `82.6MB`；varuint 收紧后约 `55.9MB`；同一 case 的 v0.1 binary 曾约 `133.7MB`。
+- VMP-Lift `trace db-build` 已能从 v0.2 binary 构建 `trace.db`，rows=`904787`，diagnostics=[]；varuint debug build 转换约 `34.5s`。
 - rotation smoke：`max-events=5000`、`max-event-file-bytes=200000` 生成 3 个 v0.2 chunks，VMP-Lift db-build rows=`5000`。
+- parity gate：`trace-output both` + VMP-Lift `trace compare-formats` 已验证 v0.2 JSONL/binary counters matched，mismatches=[]。
 
 ## 11. Symbol / Call Semantic
 

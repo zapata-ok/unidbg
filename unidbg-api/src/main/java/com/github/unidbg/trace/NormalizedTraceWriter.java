@@ -27,6 +27,8 @@ final class NormalizedTraceWriter implements Closeable {
     private final List<String> diagnostics = new ArrayList<>();
     private static final String POISON = new String("normalized-trace-writer-poison");
     private long seq;
+    private long droppedJsonlLines;
+    private boolean jsonlDropDiagnosticEmitted;
     private boolean closed;
 
     NormalizedTraceWriter(NormalizedTraceConfig config) throws IOException {
@@ -64,7 +66,7 @@ final class NormalizedTraceWriter implements Closeable {
             seq++;
             event.put("seq", seq);
             if (writer != null) {
-                enqueue(JSON.toJSONString(event));
+                enqueueJsonl(JSON.toJSONString(event));
             }
             counters.events++;
             if ("instruction".equals(kind)) {
@@ -104,42 +106,42 @@ final class NormalizedTraceWriter implements Closeable {
             return false;
         }
         long currentSeq = ++seq;
-        StringBuilder sb = new StringBuilder(512 + instruction.memoryAccesses.size() * 96);
-        sb.append('{');
-        appendStringField(sb, "thread_id", "main");
-        appendCommaStringField(sb, "kind", "instruction");
-        appendCommaStringField(sb, "pc", NormalizedTraceModuleResolver.hex(instruction.pc));
-        appendCommaStringFieldOrNull(sb, "module", instruction.moduleFields.moduleName);
-        appendCommaStringFieldOrNull(sb, "file_offset", instruction.moduleFields.fileOffset);
-        if (instruction.moduleFields.symbol != null) {
-            appendCommaStringField(sb, "symbol", instruction.moduleFields.symbol);
-        }
-        sb.append(",\"instruction\":{");
-        appendStringField(sb, "bytes", config.includeInstructionBytes ? instruction.instruction.bytesHex : "");
-        appendCommaStringField(sb, "mnemonic", instruction.instruction.mnemonic);
-        sb.append(",\"operands\":[");
-        for (int i = 0; i < instruction.instruction.operands.size(); i++) {
-            if (i > 0) sb.append(',');
-            appendJsonString(sb, instruction.instruction.operands.get(i));
-        }
-        sb.append("]}");
-        sb.append(",\"memory\":[");
-        for (int i = 0; i < instruction.memoryAccesses.size(); i++) {
-            if (i > 0) sb.append(',');
-            appendMemoryAccess(sb, instruction.memoryAccesses.get(i));
-        }
-        sb.append(']');
-        if (instruction.instruction.branch != null) {
-            appendBranch(sb, instruction.instruction.branch);
-        }
-        sb.append(",\"backend\":{");
-        appendStringField(sb, "name", instruction.backendName);
-        appendCommaStringField(sb, "raw_kind", "code_hook");
-        sb.append('}');
-        appendRegisters(sb, instruction, afterRegisters);
-        sb.append(",\"seq\":").append(currentSeq).append('}');
         if (writer != null) {
-            enqueue(sb.toString());
+            StringBuilder sb = new StringBuilder(512 + instruction.memoryAccesses.size() * 96);
+            sb.append('{');
+            appendStringField(sb, "thread_id", "main");
+            appendCommaStringField(sb, "kind", "instruction");
+            appendCommaStringField(sb, "pc", NormalizedTraceModuleResolver.hex(instruction.pc));
+            appendCommaStringFieldOrNull(sb, "module", instruction.moduleFields.moduleName);
+            appendCommaStringFieldOrNull(sb, "file_offset", instruction.moduleFields.fileOffset);
+            if (instruction.moduleFields.symbol != null) {
+                appendCommaStringField(sb, "symbol", instruction.moduleFields.symbol);
+            }
+            sb.append(",\"instruction\":{");
+            appendStringField(sb, "bytes", config.includeInstructionBytes ? instruction.instruction.bytesHex : "");
+            appendCommaStringField(sb, "mnemonic", instruction.instruction.mnemonic);
+            sb.append(",\"operands\":[");
+            for (int i = 0; i < instruction.instruction.operands.size(); i++) {
+                if (i > 0) sb.append(',');
+                appendJsonString(sb, instruction.instruction.operands.get(i));
+            }
+            sb.append("]}");
+            sb.append(",\"memory\":[");
+            for (int i = 0; i < instruction.memoryAccesses.size(); i++) {
+                if (i > 0) sb.append(',');
+                appendMemoryAccess(sb, instruction.memoryAccesses.get(i));
+            }
+            sb.append(']');
+            if (instruction.instruction.branch != null) {
+                appendBranch(sb, instruction.instruction.branch);
+            }
+            sb.append(",\"backend\":{");
+            appendStringField(sb, "name", instruction.backendName);
+            appendCommaStringField(sb, "raw_kind", "code_hook");
+            sb.append('}');
+            appendRegisters(sb, instruction, afterRegisters);
+            sb.append(",\"seq\":").append(currentSeq).append('}');
+            enqueueJsonl(sb.toString());
         }
         try {
             if (binaryWriter != null) {
@@ -169,28 +171,28 @@ final class NormalizedTraceWriter implements Closeable {
             return false;
         }
         long currentSeq = ++seq;
-        StringBuilder sb = new StringBuilder(256);
-        sb.append('{');
-        appendStringField(sb, "thread_id", "main");
-        appendCommaStringField(sb, "kind", kind);
-        appendCommaStringField(sb, "pc", NormalizedTraceModuleResolver.hex(pc));
-        if (moduleFields != null) {
-            appendCommaStringFieldOrNull(sb, "module", moduleFields.moduleName);
-            appendCommaStringFieldOrNull(sb, "file_offset", moduleFields.fileOffset);
-            if (moduleFields.symbol != null) {
-                appendCommaStringField(sb, "symbol", moduleFields.symbol);
-            }
-        }
-        sb.append(",\"backend\":{");
-        appendStringField(sb, "name", backendName);
-        appendCommaStringField(sb, "raw_kind", rawKind);
-        sb.append('}');
-        sb.append(",\"memory\":[");
-        appendMemoryAccess(sb, access);
-        sb.append(']');
-        sb.append(",\"seq\":").append(currentSeq).append('}');
         if (writer != null) {
-            enqueue(sb.toString());
+            StringBuilder sb = new StringBuilder(256);
+            sb.append('{');
+            appendStringField(sb, "thread_id", "main");
+            appendCommaStringField(sb, "kind", kind);
+            appendCommaStringField(sb, "pc", NormalizedTraceModuleResolver.hex(pc));
+            if (moduleFields != null) {
+                appendCommaStringFieldOrNull(sb, "module", moduleFields.moduleName);
+                appendCommaStringFieldOrNull(sb, "file_offset", moduleFields.fileOffset);
+                if (moduleFields.symbol != null) {
+                    appendCommaStringField(sb, "symbol", moduleFields.symbol);
+                }
+            }
+            sb.append(",\"backend\":{");
+            appendStringField(sb, "name", backendName);
+            appendCommaStringField(sb, "raw_kind", rawKind);
+            sb.append('}');
+            sb.append(",\"memory\":[");
+            appendMemoryAccess(sb, access);
+            sb.append(']');
+            sb.append(",\"seq\":").append(currentSeq).append('}');
+            enqueueJsonl(sb.toString());
         }
         try {
             if (binaryWriter != null) {
@@ -334,7 +336,22 @@ final class NormalizedTraceWriter implements Closeable {
         sb.append('"');
     }
 
-    private void enqueue(String line) {
+    private void enqueueJsonl(String line) {
+        if (binaryWriter != null) {
+            if (queue.offer(line)) {
+                return;
+            }
+            droppedJsonlLines++;
+            if (!jsonlDropDiagnosticEmitted) {
+                jsonlDropDiagnosticEmitted = true;
+                diagnostics.add("jsonl audit queue full; dropping JSONL lines while binary trace continues");
+            }
+            return;
+        }
+        enqueueBlocking(line);
+    }
+
+    private void enqueueBlocking(String line) {
         try {
             queue.put(line);
         } catch (InterruptedException e) {
@@ -416,7 +433,7 @@ final class NormalizedTraceWriter implements Closeable {
         }
         closed = true;
         if (writer != null) {
-            enqueue(POISON);
+            enqueueBlocking(POISON);
             try {
                 writerThread.join();
             } catch (InterruptedException e) {
@@ -474,6 +491,7 @@ final class NormalizedTraceWriter implements Closeable {
         counts.put("memory_writes", counters.memoryWrites);
         counts.put("register_writes", counters.registerWrites);
         counts.put("dropped_events", counters.droppedEvents);
+        counts.put("dropped_jsonl_lines", droppedJsonlLines);
         counts.put("malformed_events", 0);
         summary.put("summary", counts);
         summary.put("diagnostics", diagnostics);
