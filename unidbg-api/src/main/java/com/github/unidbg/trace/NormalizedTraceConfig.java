@@ -21,17 +21,31 @@ public final class NormalizedTraceConfig {
         FULL
     }
 
+    public enum Profile {
+        DEFAULT,
+        FAST_PC,
+        FAST_MEM,
+        REG_DELTA,
+        FULL_JSONL,
+        CALL_SEMANTIC,
+        DB_HOT
+    }
+
     public final String caseId;
     public final File outputDir;
     public final String backendName;
     public final Level level;
+    public final Profile profile;
     public final long maxEvents;
     public final long maxEventFileBytes;
     public final Module targetModule;
+    public final String targetModuleName;
     public final long traceBegin;
     public final long traceEnd;
     public final List<AddressRange> memoryRanges;
     public final Map<String, Integer> selectedRegisters;
+    final String[] selectedRegisterNames;
+    final int[] selectedRegisterIds;
     public final int memoryValueLimit;
     public final boolean includeInstructionBytes;
     public final boolean includeInstructionDecode;
@@ -45,13 +59,20 @@ public final class NormalizedTraceConfig {
         this.outputDir = builder.outputDir;
         this.backendName = builder.backendName;
         this.level = builder.level;
+        this.profile = builder.profile;
         this.maxEvents = builder.maxEvents;
         this.maxEventFileBytes = builder.maxEventFileBytes;
         this.targetModule = builder.targetModule;
+        this.targetModuleName = builder.targetModuleName;
         this.traceBegin = builder.traceBegin;
         this.traceEnd = builder.traceEnd;
         this.memoryRanges = Collections.unmodifiableList(new ArrayList<>(builder.memoryRanges));
         this.selectedRegisters = Collections.unmodifiableMap(new LinkedHashMap<>(builder.selectedRegisters));
+        this.selectedRegisterNames = this.selectedRegisters.keySet().toArray(new String[0]);
+        this.selectedRegisterIds = new int[this.selectedRegisterNames.length];
+        for (int i = 0; i < this.selectedRegisterNames.length; i++) {
+            this.selectedRegisterIds[i] = this.selectedRegisters.get(this.selectedRegisterNames[i]);
+        }
         this.memoryValueLimit = builder.memoryValueLimit;
         this.includeInstructionBytes = builder.includeInstructionBytes;
         this.includeInstructionDecode = builder.includeInstructionDecode;
@@ -155,9 +176,11 @@ public final class NormalizedTraceConfig {
         private File outputDir = new File("out");
         private String backendName = "unidbg";
         private Level level = Level.INSTRUCTION;
+        private Profile profile = Profile.DEFAULT;
         private long maxEvents = 1_000_000L;
         private long maxEventFileBytes = 0L;
         private Module targetModule;
+        private String targetModuleName;
         private long traceBegin = 1;
         private long traceEnd = 0;
         private final List<AddressRange> memoryRanges = new ArrayList<>();
@@ -190,6 +213,32 @@ public final class NormalizedTraceConfig {
             return this;
         }
 
+        public Builder profile(Profile profile) {
+            this.profile = profile;
+            if (profile == Profile.FAST_PC) {
+                this.level = Level.INSTRUCTION;
+                this.includeInstructionDecode = false;
+                this.includeMemoryValues = false;
+            } else if (profile == Profile.FAST_MEM) {
+                this.level = Level.MEMORY;
+                this.includeRegisterWrites = false;
+                this.includeMemoryValues = true;
+            } else if (profile == Profile.REG_DELTA) {
+                this.level = Level.REGISTERS;
+                this.includeMemoryValues = false;
+            } else if (profile == Profile.FULL_JSONL) {
+                this.level = Level.FULL;
+                this.includeInstructionDecode = true;
+                this.includeRegisterWrites = true;
+                this.includeMemoryValues = true;
+            } else if (profile == Profile.DB_HOT) {
+                this.level = Level.MEMORY;
+                this.includeRegisterWrites = false;
+                this.includeRegisterReads = false;
+            }
+            return this;
+        }
+
         public Builder maxEvents(long maxEvents) {
             this.maxEvents = maxEvents;
             return this;
@@ -203,9 +252,15 @@ public final class NormalizedTraceConfig {
         public Builder targetModule(Module targetModule) {
             this.targetModule = targetModule;
             if (targetModule != null) {
+                this.targetModuleName = targetModule.name;
                 this.traceBegin = targetModule.base;
                 this.traceEnd = targetModule.base + targetModule.size;
             }
+            return this;
+        }
+
+        public Builder targetModuleName(String targetModuleName) {
+            this.targetModuleName = targetModuleName;
             return this;
         }
 
@@ -272,6 +327,9 @@ public final class NormalizedTraceConfig {
             }
             if (level == null) {
                 level = Level.INSTRUCTION;
+            }
+            if (profile == null) {
+                profile = Profile.DEFAULT;
             }
             if (selectedRegisters == null) {
                 selectedRegisters = arm64GprAll();

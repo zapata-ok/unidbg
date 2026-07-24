@@ -26,6 +26,20 @@ final class NormalizedTraceRegisters {
         return snapshot;
     }
 
+    static Snapshot snapshot(Backend backend, NormalizedTraceConfig config) {
+        long[] values = new long[config.selectedRegisterIds.length];
+        boolean[] valid = new boolean[config.selectedRegisterIds.length];
+        for (int i = 0; i < config.selectedRegisterIds.length; i++) {
+            try {
+                values[i] = backend.reg_read(config.selectedRegisterIds[i]).longValue();
+                valid[i] = true;
+            } catch (RuntimeException ignored) {
+                // Skip registers unsupported by current backend.
+            }
+        }
+        return new Snapshot(config.selectedRegisterNames, values, valid);
+    }
+
     static Map<String, String> delta(Map<String, String> before, Map<String, String> after) {
         LinkedHashMap<String, String> writes = new LinkedHashMap<>();
         for (Map.Entry<String, String> entry : after.entrySet()) {
@@ -62,6 +76,53 @@ final class NormalizedTraceRegisters {
             // Register reads are best effort.
         }
         return reads;
+    }
+
+    static Map<String, String> reads(Emulator<?> emulator, Backend backend, Instruction instruction, Snapshot snapshot) {
+        LinkedHashMap<String, String> reads = new LinkedHashMap<>();
+        try {
+            RegsAccess access = instruction.regsAccess();
+            if (access == null) {
+                return reads;
+            }
+            for (short reg : access.getRegsRead()) {
+                String name = canonicalRegisterName(emulator, instruction, reg);
+                if (name == null || reads.containsKey(name)) {
+                    continue;
+                }
+                Long value = snapshot == null ? null : snapshot.get(name);
+                if (value != null) {
+                    reads.put(name, NormalizedTraceModuleResolver.hex(value));
+                } else {
+                    int regId = instruction.mapToUnicornReg(reg);
+                    reads.put(name, NormalizedTraceModuleResolver.hex(backend.reg_read(regId).longValue()));
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // Register reads are best effort.
+        }
+        return reads;
+    }
+
+    static final class Snapshot {
+        final String[] names;
+        final long[] values;
+        final boolean[] valid;
+
+        Snapshot(String[] names, long[] values, boolean[] valid) {
+            this.names = names;
+            this.values = values;
+            this.valid = valid;
+        }
+
+        Long get(String name) {
+            for (int i = 0; i < names.length; i++) {
+                if (valid[i] && names[i].equals(name)) {
+                    return values[i];
+                }
+            }
+            return null;
+        }
     }
 
     private static String canonicalRegisterName(Emulator<?> emulator, Instruction instruction, short capstoneReg) {

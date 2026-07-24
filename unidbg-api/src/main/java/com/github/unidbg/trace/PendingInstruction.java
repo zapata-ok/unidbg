@@ -1,35 +1,35 @@
 package com.github.unidbg.trace;
 
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 final class PendingInstruction {
 
-    private final Map<String, Object> event;
-    private final Map<String, String> beforeRegisters;
-    private final Map<String, String> registerReads;
-    private final List<Map<String, Object>> memoryAccesses = new ArrayList<>();
+    final long pc;
+    final ModuleFields moduleFields;
+    final CachedInstruction instruction;
+    final NormalizedTraceRegisters.Snapshot beforeRegisters;
+    final Map<String, String> registerReads;
+    final String backendName;
+    final List<MemoryAccess> memoryAccesses = new ArrayList<>();
 
-    PendingInstruction(Map<String, Object> event, Map<String, String> beforeRegisters, Map<String, String> registerReads) {
-        this.event = event;
+    PendingInstruction(long pc, ModuleFields moduleFields, CachedInstruction instruction,
+                       NormalizedTraceRegisters.Snapshot beforeRegisters, Map<String, String> registerReads,
+                       String backendName) {
+        this.pc = pc;
+        this.moduleFields = moduleFields;
+        this.instruction = instruction;
         this.beforeRegisters = beforeRegisters;
         this.registerReads = registerReads;
+        this.backendName = backendName;
     }
 
-    void addMemoryAccess(Map<String, Object> memoryAccess) {
+    void addMemoryAccess(MemoryAccess memoryAccess) {
         memoryAccesses.add(memoryAccess);
     }
 
-    void flush(NormalizedTraceWriter writer, Map<String, String> afterRegisters) {
-        Map<String, String> writes = afterRegisters == null ? new LinkedHashMap<>() : NormalizedTraceRegisters.delta(beforeRegisters, afterRegisters);
-        Map<String, Object> registers = new LinkedHashMap<>();
-        registers.put("reads", registerReads);
-        registers.put("writes", writes);
-        event.put("registers", registers);
-        event.put("memory", memoryAccesses.isEmpty() ? Collections.emptyList() : new ArrayList<>(memoryAccesses));
-        writer.writeEvent("instruction", event);
+    void flush(NormalizedTraceWriter writer, NormalizedTraceRegisters.Snapshot afterRegisters) {
+        writer.writeInstruction(this, afterRegisters);
     }
 }

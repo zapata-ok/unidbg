@@ -86,6 +86,225 @@ final class NormalizedTraceWriter implements Closeable {
         }
     }
 
+    boolean writeInstruction(PendingInstruction instruction, NormalizedTraceRegisters.Snapshot afterRegisters) {
+        if (closed) {
+            counters.droppedEvents++;
+            return false;
+        }
+        if (config.maxEvents > 0 && counters.events >= config.maxEvents) {
+            counters.droppedEvents++;
+            return false;
+        }
+        long currentSeq = ++seq;
+        StringBuilder sb = new StringBuilder(512 + instruction.memoryAccesses.size() * 96);
+        sb.append('{');
+        appendStringField(sb, "thread_id", "main");
+        appendCommaStringField(sb, "kind", "instruction");
+        appendCommaStringField(sb, "pc", NormalizedTraceModuleResolver.hex(instruction.pc));
+        appendCommaStringFieldOrNull(sb, "module", instruction.moduleFields.moduleName);
+        appendCommaStringFieldOrNull(sb, "file_offset", instruction.moduleFields.fileOffset);
+        if (instruction.moduleFields.symbol != null) {
+            appendCommaStringField(sb, "symbol", instruction.moduleFields.symbol);
+        }
+        sb.append(",\"instruction\":{");
+        appendStringField(sb, "bytes", config.includeInstructionBytes ? instruction.instruction.bytesHex : "");
+        appendCommaStringField(sb, "mnemonic", instruction.instruction.mnemonic);
+        sb.append(",\"operands\":[");
+        for (int i = 0; i < instruction.instruction.operands.size(); i++) {
+            if (i > 0) sb.append(',');
+            appendJsonString(sb, instruction.instruction.operands.get(i));
+        }
+        sb.append("]}");
+        sb.append(",\"memory\":[");
+        for (int i = 0; i < instruction.memoryAccesses.size(); i++) {
+            if (i > 0) sb.append(',');
+            appendMemoryAccess(sb, instruction.memoryAccesses.get(i));
+        }
+        sb.append(']');
+        if (instruction.instruction.branch != null) {
+            appendBranch(sb, instruction.instruction.branch);
+        }
+        sb.append(",\"backend\":{");
+        appendStringField(sb, "name", instruction.backendName);
+        appendCommaStringField(sb, "raw_kind", "code_hook");
+        sb.append('}');
+        appendRegisters(sb, instruction, afterRegisters);
+        sb.append(",\"seq\":").append(currentSeq).append('}');
+        enqueue(sb.toString());
+        counters.events++;
+        counters.instructions++;
+        if (instruction.instruction.branch != null) {
+            counters.branches++;
+        }
+        if (hasRegisterWrites(instruction.beforeRegisters, afterRegisters)) {
+            counters.registerWrites++;
+        }
+        return true;
+    }
+
+    boolean writeMemoryEvent(String kind, ModuleFields moduleFields, String backendName, String rawKind, long pc, MemoryAccess access) {
+        if (closed) {
+            counters.droppedEvents++;
+            return false;
+        }
+        if (config.maxEvents > 0 && counters.events >= config.maxEvents) {
+            counters.droppedEvents++;
+            return false;
+        }
+        long currentSeq = ++seq;
+        StringBuilder sb = new StringBuilder(256);
+        sb.append('{');
+        appendStringField(sb, "thread_id", "main");
+        appendCommaStringField(sb, "kind", kind);
+        appendCommaStringField(sb, "pc", NormalizedTraceModuleResolver.hex(pc));
+        if (moduleFields != null) {
+            appendCommaStringFieldOrNull(sb, "module", moduleFields.moduleName);
+            appendCommaStringFieldOrNull(sb, "file_offset", moduleFields.fileOffset);
+            if (moduleFields.symbol != null) {
+                appendCommaStringField(sb, "symbol", moduleFields.symbol);
+            }
+        }
+        sb.append(",\"backend\":{");
+        appendStringField(sb, "name", backendName);
+        appendCommaStringField(sb, "raw_kind", rawKind);
+        sb.append('}');
+        sb.append(",\"memory\":[");
+        appendMemoryAccess(sb, access);
+        sb.append(']');
+        sb.append(",\"seq\":").append(currentSeq).append('}');
+        enqueue(sb.toString());
+        counters.events++;
+        if ("memory_read".equals(kind)) {
+            counters.memoryReads++;
+        } else if ("memory_write".equals(kind)) {
+            counters.memoryWrites++;
+        }
+        return true;
+    }
+
+    private void appendRegisters(StringBuilder sb, PendingInstruction instruction, NormalizedTraceRegisters.Snapshot afterRegisters) {
+        sb.append(",\"registers\":{");
+        sb.append("\"reads\":{");
+        int emitted = 0;
+        for (Map.Entry<String, String> entry : instruction.registerReads.entrySet()) {
+            if (emitted++ > 0) sb.append(',');
+            appendJsonString(sb, entry.getKey());
+            sb.append(':');
+            appendJsonString(sb, entry.getValue());
+        }
+        sb.append("},\"writes\":{");
+        if (afterRegisters != null && instruction.beforeRegisters != null) {
+            emitted = 0;
+            int len = Math.min(instruction.beforeRegisters.names.length, afterRegisters.names.length);
+            for (int i = 0; i < len; i++) {
+                if (!instruction.beforeRegisters.valid[i] || !afterRegisters.valid[i]) {
+                    continue;
+                }
+                if (instruction.beforeRegisters.values[i] == afterRegisters.values[i]) {
+                    continue;
+                }
+                if (emitted++ > 0) sb.append(',');
+                appendJsonString(sb, afterRegisters.names[i]);
+                sb.append(':');
+                appendJsonString(sb, NormalizedTraceModuleResolver.hex(afterRegisters.values[i]));
+            }
+        }
+        sb.append("}}");
+    }
+
+    private boolean hasRegisterWrites(NormalizedTraceRegisters.Snapshot before, NormalizedTraceRegisters.Snapshot after) {
+        if (before == null || after == null) {
+            return false;
+        }
+        int len = Math.min(before.names.length, after.names.length);
+        for (int i = 0; i < len; i++) {
+            if (before.valid[i] && after.valid[i] && before.values[i] != after.values[i]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void appendMemoryAccess(StringBuilder sb, MemoryAccess access) {
+        sb.append('{');
+        appendStringField(sb, "access", access.access);
+        appendCommaStringField(sb, "address", NormalizedTraceModuleResolver.hex(access.address));
+        sb.append(",\"size\":").append(access.size);
+        sb.append(",\"value_hex\":");
+        if (access.valueHex == null) {
+            sb.append("null");
+        } else {
+            appendJsonString(sb, access.valueHex);
+        }
+        sb.append(",\"taint\":[]}");
+    }
+
+    private void appendBranch(StringBuilder sb, BranchInfo branch) {
+        sb.append(",\"branch\":{");
+        sb.append("\"taken\":").append(branch.taken);
+        sb.append(",\"target\":");
+        if (branch.target == null) {
+            sb.append("null");
+        } else {
+            appendJsonString(sb, branch.target);
+        }
+        appendCommaStringField(sb, "fallthrough", branch.fallthrough);
+        sb.append(",\"condition_registers\":[");
+        for (int i = 0; i < branch.conditionRegisters.size(); i++) {
+            if (i > 0) sb.append(',');
+            appendJsonString(sb, branch.conditionRegisters.get(i));
+        }
+        sb.append("]}");
+    }
+
+    private void appendStringField(StringBuilder sb, String key, String value) {
+        appendJsonString(sb, key);
+        sb.append(':');
+        appendJsonString(sb, value);
+    }
+
+    private void appendCommaStringField(StringBuilder sb, String key, String value) {
+        sb.append(',');
+        appendStringField(sb, key, value);
+    }
+
+    private void appendCommaStringFieldOrNull(StringBuilder sb, String key, String value) {
+        sb.append(',');
+        appendJsonString(sb, key);
+        sb.append(':');
+        if (value == null) {
+            sb.append("null");
+        } else {
+            appendJsonString(sb, value);
+        }
+    }
+
+    private void appendJsonString(StringBuilder sb, String value) {
+        sb.append('"');
+        if (value != null) {
+            for (int i = 0; i < value.length(); i++) {
+                char c = value.charAt(i);
+                if (c == '"' || c == '\\') {
+                    sb.append('\\').append(c);
+                } else if (c == '\n') {
+                    sb.append("\\n");
+                } else if (c == '\r') {
+                    sb.append("\\r");
+                } else if (c == '\t') {
+                    sb.append("\\t");
+                } else if (c < 0x20) {
+                    sb.append("\\u00");
+                    String hex = Integer.toHexString(c);
+                    if (hex.length() == 1) sb.append('0');
+                    sb.append(hex);
+                } else {
+                    sb.append(c);
+                }
+            }
+        }
+        sb.append('"');
+    }
+
     private void enqueue(String line) {
         try {
             queue.put(line);

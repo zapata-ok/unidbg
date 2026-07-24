@@ -11,15 +11,18 @@ import org.apache.commons.codec.binary.Hex;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 public final class NormalizedTraceInstaller {
+
+    private static final char[] HEX = "0123456789abcdef".toCharArray();
 
     private NormalizedTraceInstaller() {
     }
@@ -33,7 +36,9 @@ public final class NormalizedTraceInstaller {
         }
         if (actualConfig.includesInstruction()) {
             TraceCodeHook hook = new TraceCodeHook(session);
-            emulator.getBackend().hook_add_new(hook, actualConfig.traceBegin, actualConfig.traceEnd, null);
+            long begin = actualConfig.targetModule == null && actualConfig.targetModuleName != null ? 1 : actualConfig.traceBegin;
+            long end = actualConfig.targetModule == null && actualConfig.targetModuleName != null ? 0 : actualConfig.traceEnd;
+            emulator.getBackend().hook_add_new(hook, begin, end, null);
         }
         if (actualConfig.includesMemory()) {
             List<AddressRange> ranges = actualConfig.memoryRanges.isEmpty()
@@ -51,26 +56,33 @@ public final class NormalizedTraceInstaller {
         private final NormalizedTraceSession session;
         private final NormalizedTraceModuleResolver resolver;
         private final CachedInstruction[] instructionCache = new CachedInstruction[8192];
-        private final Map<Long, CachedInstruction> overflowInstructionCache = new HashMap<>();
+        private final Map<Long, CachedInstruction> overflowInstructionCache = new java.util.LinkedHashMap<Long, CachedInstruction>(4096, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<Long, CachedInstruction> eldest) {
+                return size() > 16384;
+            }
+        };
         private long svcMemoryBase = -1;
         private long svcMemoryEnd = -1;
         private UnHook unHook;
 
         private TraceCodeHook(NormalizedTraceSession session) {
             this.session = session;
-            this.resolver = new NormalizedTraceModuleResolver(session.config().targetModule);
+            this.resolver = new NormalizedTraceModuleResolver(session.emulator(), session.config().targetModule, session.config().targetModuleName);
         }
 
         @Override
         public void hook(Backend backend, long address, int size, Object user) {
             NormalizedTraceConfig config = session.config();
-            Map<String, String> currentRegisters = config.includesRegisters()
-                    ? NormalizedTraceRegisters.snapshot(backend, config.selectedRegisters)
-                    : Collections.emptyMap();
-            PendingInstruction previous = session.pendingInstruction();
-            if (previous != null) {
-                previous.flush(session.writer(), currentRegisters);
+            if (config.targetModule == null && config.targetModuleName != null && !resolver.contains(address)) {
+                flushPrevious(backend, null);
+                session.stopIfNeeded();
+                return;
             }
+            NormalizedTraceRegisters.Snapshot currentRegisters = config.includesRegisters()
+                    ? NormalizedTraceRegisters.snapshot(backend, config)
+                    : null;
+            flushPrevious(backend, currentRegisters);
             if (isSvcMemory(address)) {
                 session.pendingInstruction(null);
                 session.stopIfNeeded();
@@ -78,6 +90,13 @@ public final class NormalizedTraceInstaller {
             }
             session.pendingInstruction(buildPendingInstruction(backend, address, size, currentRegisters));
             session.stopIfNeeded();
+        }
+
+        private void flushPrevious(Backend backend, NormalizedTraceRegisters.Snapshot currentRegisters) {
+            PendingInstruction previous = session.pendingInstruction();
+            if (previous != null) {
+                previous.flush(session.writer(), currentRegisters);
+            }
         }
 
         private boolean isSvcMemory(long address) {
@@ -97,29 +116,13 @@ public final class NormalizedTraceInstaller {
             return svcMemoryBase > 0 && address >= svcMemoryBase && address < svcMemoryEnd;
         }
 
-        private PendingInstruction buildPendingInstruction(Backend backend, long address, int size, Map<String, String> beforeRegisters) {
+        private PendingInstruction buildPendingInstruction(Backend backend, long address, int size, NormalizedTraceRegisters.Snapshot beforeRegisters) {
             NormalizedTraceConfig config = session.config();
             CachedInstruction instruction = cachedInstruction(backend, address, size);
-            Map<String, Object> event = new LinkedHashMap<>();
-            event.put("thread_id", "main");
-            event.put("kind", "instruction");
-            event.put("pc", NormalizedTraceModuleResolver.hex(address));
-            resolver.putModuleFields(event, address);
-            Map<String, Object> instructionJson = new LinkedHashMap<>();
-            instructionJson.put("bytes", config.includeInstructionBytes ? instruction.bytesHex : "");
-            instructionJson.put("mnemonic", instruction.mnemonic);
-            instructionJson.put("operands", instruction.operands);
-            event.put("instruction", instructionJson);
-            event.put("memory", Collections.emptyList());
-            event.put("branch", instruction.branch);
-            Map<String, Object> backendJson = new LinkedHashMap<>();
-            backendJson.put("name", config.backendName);
-            backendJson.put("raw_kind", "code_hook");
-            event.put("backend", backendJson);
             Map<String, String> reads = config.includeRegisterReads && instruction.rawInstruction != null
                     ? NormalizedTraceRegisters.reads(session.emulator(), backend, instruction.rawInstruction, beforeRegisters)
                     : Collections.emptyMap();
-            return new PendingInstruction(event, beforeRegisters, reads);
+            return new PendingInstruction(address, resolver.moduleFields(address), instruction, beforeRegisters, reads, config.backendName);
         }
 
         private CachedInstruction cachedInstruction(Backend backend, long address, int size) {
@@ -147,6 +150,7 @@ public final class NormalizedTraceInstaller {
             Instruction rawInstruction = decodeInstruction(address, bytes);
             String mnemonic = rawInstruction == null ? "unknown" : safeString(rawInstruction.getMnemonic(), "unknown");
             List<String> operands = rawInstruction == null ? Collections.emptyList() : operands(rawInstruction);
+            boolean keepRawInstruction = session.config().includeRegisterReads;
             return new CachedInstruction(
                     address,
                     size,
@@ -154,7 +158,7 @@ public final class NormalizedTraceInstaller {
                     mnemonic,
                     operands,
                     branch(address, size, rawInstruction),
-                    rawInstruction);
+                    keepRawInstruction ? rawInstruction : null);
         }
 
         private byte[] readBytes(Backend backend, long address, int size) {
@@ -192,7 +196,7 @@ public final class NormalizedTraceInstaller {
             return operands;
         }
 
-        private Map<String, Object> branch(long address, int size, Instruction instruction) {
+        private BranchInfo branch(long address, int size, Instruction instruction) {
             if (instruction == null || instruction.getMnemonic() == null) {
                 return null;
             }
@@ -200,33 +204,8 @@ public final class NormalizedTraceInstaller {
             if (!(mnemonic.equals("b") || mnemonic.startsWith("b.") || mnemonic.equals("bl") || mnemonic.equals("blr") || mnemonic.equals("br") || mnemonic.equals("ret") || mnemonic.equals("cbz") || mnemonic.equals("cbnz") || mnemonic.equals("tbz") || mnemonic.equals("tbnz"))) {
                 return null;
             }
-            Map<String, Object> branch = new LinkedHashMap<>();
-            branch.put("taken", true);
             String target = parseBranchTarget(instruction.getOpStr());
-            branch.put("target", target == null ? null : target);
-            branch.put("fallthrough", NormalizedTraceModuleResolver.hex(address + size));
-            branch.put("condition_registers", mnemonic.startsWith("b.") ? Collections.singletonList("nzcv") : Collections.emptyList());
-            return branch;
-        }
-
-        private static final class CachedInstruction {
-            private final long address;
-            private final int size;
-            private final String bytesHex;
-            private final String mnemonic;
-            private final List<String> operands;
-            private final Map<String, Object> branch;
-            private final Instruction rawInstruction;
-
-            private CachedInstruction(long address, int size, String bytesHex, String mnemonic, List<String> operands, Map<String, Object> branch, Instruction rawInstruction) {
-                this.address = address;
-                this.size = size;
-                this.bytesHex = bytesHex;
-                this.mnemonic = mnemonic;
-                this.operands = operands;
-                this.branch = branch;
-                this.rawInstruction = rawInstruction;
-            }
+            return new BranchInfo(true, target, NormalizedTraceModuleResolver.hex(address + size), mnemonic.startsWith("b.") ? Collections.singletonList("nzcv") : Collections.<String>emptyList());
         }
 
         private String parseBranchTarget(String opStr) {
@@ -267,7 +246,7 @@ public final class NormalizedTraceInstaller {
 
         private TraceReadHook(NormalizedTraceSession session) {
             this.session = session;
-            this.resolver = new NormalizedTraceModuleResolver(session.config().targetModule);
+            this.resolver = new NormalizedTraceModuleResolver(session.emulator(), session.config().targetModule, session.config().targetModuleName);
         }
 
         @Override
@@ -277,44 +256,19 @@ public final class NormalizedTraceInstaller {
         }
 
         private void writeMemoryEvent(Backend backend, String kind, String rawKind, String access, long address, int size, Long writeValue) {
-            Map<String, Object> memoryAccess = memoryAccess(backend, access, address, size, writeValue);
+            MemoryAccess memoryAccess = memoryAccess(backend, access, address, size, writeValue);
             PendingInstruction pending = session.pendingInstruction();
             if (pending != null) {
                 pending.addMemoryAccess(memoryAccess);
                 session.writer().recordMemoryAccess(access);
                 return;
             }
-            Map<String, Object> event = baseMemoryEvent(backend, kind, rawKind);
-            event.put("memory", Collections.singletonList(memoryAccess));
-            session.writer().writeEvent(kind, event);
-        }
-
-        private Map<String, Object> baseMemoryEvent(Backend backend, String kind, String rawKind) {
             long pc = readPc(backend);
-            Map<String, Object> event = new LinkedHashMap<>();
-            event.put("thread_id", "main");
-            event.put("kind", kind);
-            event.put("pc", NormalizedTraceModuleResolver.hex(pc));
-            resolver.putModuleFields(event, pc);
-            Map<String, Object> backendJson = new LinkedHashMap<>();
-            backendJson.put("name", session.config().backendName);
-            backendJson.put("raw_kind", rawKind);
-            event.put("backend", backendJson);
-            return event;
+            session.writer().writeMemoryEvent(kind, resolver.moduleFields(pc), session.config().backendName, rawKind, pc, memoryAccess);
         }
 
-        private Map<String, Object> memoryAccess(Backend backend, String access, long address, int size, Long writeValue) {
-            Map<String, Object> memory = new LinkedHashMap<>();
-            memory.put("access", access);
-            memory.put("address", NormalizedTraceModuleResolver.hex(address));
-            memory.put("size", size);
-            memory.put("value_hex", valueHex(backend, access, address, size, writeValue));
-            memory.put("region", null);
-            memory.put("module", null);
-            memory.put("symbol", null);
-            memory.put("taint", Collections.emptyList());
-            memory.put("note", null);
-            return memory;
+        private MemoryAccess memoryAccess(Backend backend, String access, long address, int size, Long writeValue) {
+            return new MemoryAccess(access, address, size, valueHex(backend, access, address, size, writeValue));
         }
 
         private String valueHex(Backend backend, String access, long address, int size, Long writeValue) {
@@ -327,7 +281,7 @@ public final class NormalizedTraceInstaller {
             }
             int limit = Math.min(size, config.memoryValueLimit);
             try {
-                return Hex.encodeHexString(backend.mem_read(address, limit));
+                return hex(backend.mem_read(address, limit));
             } catch (RuntimeException e) {
                 session.writer().addDiagnostic("memory value read failed at " + NormalizedTraceModuleResolver.hex(address) + ": " + e.getMessage());
                 return null;
@@ -395,10 +349,23 @@ public final class NormalizedTraceInstaller {
     }
 
     private static String formatIntegerValue(long value, int size) {
-        byte[] bytes = new byte[Math.max(size, 1)];
-        for (int i = 0; i < bytes.length; i++) {
-            bytes[i] = (byte) ((value >>> (i * 8)) & 0xff);
+        int actualSize = Math.max(size, 1);
+        char[] out = new char[actualSize * 2];
+        for (int i = 0; i < actualSize; i++) {
+            int b = (int) ((value >>> (i * 8)) & 0xff);
+            out[i * 2] = HEX[b >>> 4];
+            out[i * 2 + 1] = HEX[b & 0xf];
         }
-        return Hex.encodeHexString(bytes);
+        return new String(out);
+    }
+
+    private static String hex(byte[] bytes) {
+        char[] out = new char[bytes.length * 2];
+        for (int i = 0; i < bytes.length; i++) {
+            int b = bytes[i] & 0xff;
+            out[i * 2] = HEX[b >>> 4];
+            out[i * 2 + 1] = HEX[b & 0xf];
+        }
+        return new String(out);
     }
 }
