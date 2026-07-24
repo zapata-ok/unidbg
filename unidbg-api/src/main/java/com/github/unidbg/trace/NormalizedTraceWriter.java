@@ -53,49 +53,6 @@ final class NormalizedTraceWriter implements Closeable {
         }
     }
 
-    boolean writeEvent(String kind, Map<String, Object> event) {
-        if (closed) {
-            counters.droppedEvents++;
-            return false;
-        }
-        if (config.maxEvents > 0 && counters.events >= config.maxEvents) {
-            counters.droppedEvents++;
-            return false;
-        }
-        try {
-            seq++;
-            event.put("seq", seq);
-            if (writer != null) {
-                enqueueJsonl(JSON.toJSONString(event));
-            }
-            counters.events++;
-            if ("instruction".equals(kind)) {
-                counters.instructions++;
-                if (event.get("branch") != null) {
-                    counters.branches++;
-                }
-                Object registers = event.get("registers");
-                if (registers instanceof Map) {
-                    Object writes = ((Map<?, ?>) registers).get("writes");
-                    if (writes instanceof Map && !((Map<?, ?>) writes).isEmpty()) {
-                        counters.registerWrites++;
-                    }
-                }
-            } else if ("memory_read".equals(kind)) {
-                counters.memoryReads++;
-            } else if ("memory_write".equals(kind)) {
-                counters.memoryWrites++;
-            } else if ("branch".equals(kind)) {
-                counters.branches++;
-            }
-            return true;
-        } catch (RuntimeException e) {
-            diagnostics.add("write trace event failed: " + e.getMessage());
-            counters.droppedEvents++;
-            return false;
-        }
-    }
-
     boolean writeInstruction(PendingInstruction instruction, NormalizedTraceRegisters.Snapshot afterRegisters) {
         if (closed) {
             counters.droppedEvents++;
@@ -383,18 +340,6 @@ final class NormalizedTraceWriter implements Closeable {
         }
     }
 
-    void flushEvents() {
-        while (!queue.isEmpty()) {
-            try {
-                Thread.sleep(1L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                diagnostics.add("trace writer flush interrupted");
-                return;
-            }
-        }
-    }
-
     void addDiagnostic(String diagnostic) {
         diagnostics.add(diagnostic);
     }
@@ -416,10 +361,6 @@ final class NormalizedTraceWriter implements Closeable {
 
     List<String> diagnostics() {
         return Collections.unmodifiableList(diagnostics);
-    }
-
-    File eventFile() {
-        return eventFile;
     }
 
     String eventFileName() {
