@@ -15,6 +15,7 @@ public final class NormalizedTraceConfig {
 
     public enum Level {
         OFF,
+        COUNT_ONLY,
         INSTRUCTION,
         REGISTERS,
         MEMORY,
@@ -85,7 +86,7 @@ public final class NormalizedTraceConfig {
     }
 
     public boolean includesInstruction() {
-        return level == Level.INSTRUCTION || level == Level.REGISTERS || level == Level.MEMORY || level == Level.FULL;
+        return level == Level.COUNT_ONLY || level == Level.INSTRUCTION || level == Level.REGISTERS || level == Level.MEMORY || level == Level.FULL;
     }
 
     public boolean includesRegisters() {

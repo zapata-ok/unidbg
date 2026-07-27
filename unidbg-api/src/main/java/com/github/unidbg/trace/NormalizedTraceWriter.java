@@ -36,8 +36,9 @@ final class NormalizedTraceWriter implements Closeable {
         if (!config.outputDir.exists() && !config.outputDir.mkdirs()) {
             throw new IOException("failed to create trace output directory: " + config.outputDir);
         }
-        boolean jsonlEnabled = config.outputFormat == TraceOutputFormat.JSONL || config.outputFormat == TraceOutputFormat.BOTH;
-        boolean binaryEnabled = config.outputFormat == TraceOutputFormat.BINARY || config.outputFormat == TraceOutputFormat.BOTH;
+        boolean outputEnabled = config.level != NormalizedTraceConfig.Level.COUNT_ONLY;
+        boolean jsonlEnabled = outputEnabled && (config.outputFormat == TraceOutputFormat.JSONL || config.outputFormat == TraceOutputFormat.BOTH);
+        boolean binaryEnabled = outputEnabled && (config.outputFormat == TraceOutputFormat.BINARY || config.outputFormat == TraceOutputFormat.BOTH);
         this.eventFile = new File(config.outputDir, "events." + config.caseId + ".000.jsonl");
         this.writer = jsonlEnabled ? new BufferedWriter(new FileWriter(eventFile)) : null;
         this.binaryWriter = binaryEnabled ? new BinaryTraceWriter(config) : null;
@@ -116,6 +117,38 @@ final class NormalizedTraceWriter implements Closeable {
         }
         counters.registerWrites += countRegisterWrites(instruction.beforeRegisters, afterRegisters);
         return true;
+    }
+
+    boolean countInstruction() {
+        if (closed) {
+            counters.droppedEvents++;
+            return false;
+        }
+        if (config.maxEvents > 0 && counters.events >= config.maxEvents) {
+            counters.droppedEvents++;
+            return false;
+        }
+        counters.events++;
+        counters.instructions++;
+        return true;
+    }
+
+    void countBranch() {
+        counters.branches++;
+    }
+
+    void countMemoryAccess(String access) {
+        if ("read".equals(access)) {
+            counters.memoryReads++;
+        } else if ("write".equals(access)) {
+            counters.memoryWrites++;
+        }
+    }
+
+    void countRegisterWrites(int count) {
+        if (count > 0) {
+            counters.registerWrites += count;
+        }
     }
 
     boolean writeMemoryEvent(String kind, ModuleFields moduleFields, String backendName, String rawKind, long pc, MemoryAccess access) {

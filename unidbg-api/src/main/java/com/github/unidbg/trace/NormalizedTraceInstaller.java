@@ -34,7 +34,20 @@ public final class NormalizedTraceInstaller {
         if (actualConfig.level == NormalizedTraceConfig.Level.OFF) {
             return session;
         }
-        if (actualConfig.includesInstruction()) {
+        if (actualConfig.level == NormalizedTraceConfig.Level.COUNT_ONLY) {
+            CountCodeHook hook = new CountCodeHook(session);
+            long begin = actualConfig.targetModule == null && actualConfig.targetModuleName != null ? 1 : actualConfig.traceBegin;
+            long end = actualConfig.targetModule == null && actualConfig.targetModuleName != null ? 0 : actualConfig.traceEnd;
+            emulator.getBackend().hook_add_new(hook, begin, end, null);
+            List<AddressRange> ranges = actualConfig.memoryRanges.isEmpty()
+                    ? Collections.singletonList(new AddressRange(1, 0))
+                    : actualConfig.memoryRanges;
+            CountMemoryHook memoryHook = new CountMemoryHook(session);
+            for (AddressRange range : ranges) {
+                emulator.getBackend().hook_add_new(memoryHook, range.begin, range.end, null);
+                emulator.getBackend().hook_add_new(new CountWriteHook(memoryHook), range.begin, range.end, null);
+            }
+        } else if (actualConfig.includesInstruction()) {
             TraceCodeHook hook = new TraceCodeHook(session);
             long begin = actualConfig.targetModule == null && actualConfig.targetModuleName != null ? 1 : actualConfig.traceBegin;
             long end = actualConfig.targetModule == null && actualConfig.targetModuleName != null ? 0 : actualConfig.traceEnd;
@@ -50,6 +63,223 @@ public final class NormalizedTraceInstaller {
             }
         }
         return session;
+    }
+
+    private static final class CountCodeHook implements CodeHook {
+        private final NormalizedTraceSession session;
+        private final NormalizedTraceModuleResolver resolver;
+        private final CachedInstruction[] instructionCache = new CachedInstruction[8192];
+        private long svcMemoryBase = -1;
+        private long svcMemoryEnd = -1;
+        private UnHook unHook;
+        private NormalizedTraceRegisters.Snapshot previousBeforeRegisters;
+
+        private CountCodeHook(NormalizedTraceSession session) {
+            this.session = session;
+            this.resolver = new NormalizedTraceModuleResolver(session.emulator(), session.config().targetModule, session.config().targetModuleName);
+        }
+
+        @Override
+        public void hook(Backend backend, long address, int size, Object user) {
+            NormalizedTraceConfig config = session.config();
+            if (config.targetModule == null && config.targetModuleName != null && !resolver.contains(address)) {
+                countPreviousRegisterWrites(backend);
+                session.stopIfNeeded();
+                return;
+            }
+            if (!isSvcMemory(address)) {
+                NormalizedTraceRegisters.Snapshot currentRegisters = NormalizedTraceRegisters.snapshot(backend, config);
+                countRegisterWrites(previousBeforeRegisters, currentRegisters);
+                CachedInstruction instruction = cachedInstruction(backend, address, size);
+                if (instruction.branch != null) {
+                    session.writer().countBranch();
+                }
+                session.writer().countInstruction();
+                previousBeforeRegisters = currentRegisters;
+            }
+            session.stopIfNeeded();
+        }
+
+        private void countPreviousRegisterWrites(Backend backend) {
+            if (previousBeforeRegisters != null) {
+                NormalizedTraceRegisters.Snapshot currentRegisters = NormalizedTraceRegisters.snapshot(backend, session.config());
+                countRegisterWrites(previousBeforeRegisters, currentRegisters);
+                previousBeforeRegisters = null;
+            }
+        }
+
+        private void countRegisterWrites(NormalizedTraceRegisters.Snapshot before, NormalizedTraceRegisters.Snapshot after) {
+            if (before == null || after == null) {
+                return;
+            }
+            int len = Math.min(before.names.length, after.names.length);
+            int count = 0;
+            for (int i = 0; i < len; i++) {
+                if (before.valid[i] && after.valid[i] && before.values[i] != after.values[i]) {
+                    count++;
+                }
+            }
+            session.writer().countRegisterWrites(count);
+        }
+
+        private CachedInstruction cachedInstruction(Backend backend, long address, int size) {
+            int slot = (int) ((address >>> 2) & (instructionCache.length - 1));
+            CachedInstruction cached = instructionCache[slot];
+            if (cached != null && cached.address == address && cached.size == size) {
+                return cached;
+            }
+            byte[] bytes = readBytes(backend, address, size);
+            Instruction rawInstruction = decodeInstruction(address, bytes);
+            String mnemonic = rawInstruction == null ? "unknown" : safeString(rawInstruction.getMnemonic(), "unknown");
+            CachedInstruction decoded = new CachedInstruction(
+                    address,
+                    size,
+                    "",
+                    mnemonic,
+                    Collections.<String>emptyList(),
+                    branch(address, size, rawInstruction),
+                    null);
+            instructionCache[slot] = decoded;
+            return decoded;
+        }
+
+        private byte[] readBytes(Backend backend, long address, int size) {
+            try {
+                return backend.mem_read(address, size);
+            } catch (RuntimeException e) {
+                session.writer().addDiagnostic("count-only instruction bytes read failed at " + NormalizedTraceModuleResolver.hex(address) + ": " + e.getMessage());
+                return new byte[0];
+            }
+        }
+
+        private Instruction decodeInstruction(long address, byte[] bytes) {
+            if (bytes.length == 0) {
+                return null;
+            }
+            try {
+                Instruction[] instructions = session.emulator().disassemble(address, bytes, false, 1);
+                return instructions.length == 0 ? null : instructions[0];
+            } catch (RuntimeException e) {
+                session.writer().addDiagnostic("count-only instruction decode failed at " + NormalizedTraceModuleResolver.hex(address) + ": " + e.getMessage());
+                return null;
+            }
+        }
+
+        private BranchInfo branch(long address, int size, Instruction instruction) {
+            if (instruction == null || instruction.getMnemonic() == null) {
+                return null;
+            }
+            String mnemonic = instruction.getMnemonic().toLowerCase(Locale.ROOT);
+            if (!(mnemonic.equals("b") || mnemonic.startsWith("b.") || mnemonic.equals("bl") || mnemonic.equals("blr") || mnemonic.equals("br") || mnemonic.equals("ret") || mnemonic.equals("cbz") || mnemonic.equals("cbnz") || mnemonic.equals("tbz") || mnemonic.equals("tbnz"))) {
+                return null;
+            }
+            return new BranchInfo(true, parseBranchTarget(instruction.getOpStr()), NormalizedTraceModuleResolver.hex(address + size), Collections.<String>emptyList());
+        }
+
+        private String parseBranchTarget(String opStr) {
+            if (opStr == null) {
+                return null;
+            }
+            for (String part : opStr.split(",")) {
+                String trimmed = part.trim();
+                if (trimmed.startsWith("#")) {
+                    trimmed = trimmed.substring(1);
+                }
+                if (trimmed.startsWith("0x") || trimmed.startsWith("0X")) {
+                    return trimmed.toLowerCase(Locale.ROOT);
+                }
+            }
+            return null;
+        }
+
+        private boolean isSvcMemory(long address) {
+            if (svcMemoryBase == -1) {
+                try {
+                    com.github.unidbg.memory.SvcMemory svcMemory = session.emulator().getSvcMemory();
+                    if (svcMemory == null) {
+                        svcMemoryBase = -2;
+                    } else {
+                        svcMemoryBase = svcMemory.getBase();
+                        svcMemoryEnd = svcMemoryBase + svcMemory.getSize();
+                    }
+                } catch (RuntimeException ignored) {
+                    svcMemoryBase = -2;
+                }
+            }
+            return svcMemoryBase > 0 && address >= svcMemoryBase && address < svcMemoryEnd;
+        }
+
+        @Override
+        public void onAttach(UnHook unHook) {
+            this.unHook = unHook;
+            session.addHook(unHook);
+        }
+
+        @Override
+        public void detach() {
+            if (unHook != null) {
+                unHook.unhook();
+                unHook = null;
+            }
+        }
+    }
+
+    private static final class CountMemoryHook implements ReadHook {
+        private final NormalizedTraceSession session;
+        private UnHook unHook;
+
+        private CountMemoryHook(NormalizedTraceSession session) {
+            this.session = session;
+        }
+
+        @Override
+        public void hook(Backend backend, long address, int size, Object user) {
+            session.writer().countMemoryAccess("read");
+            session.stopIfNeeded();
+        }
+
+        @Override
+        public void onAttach(UnHook unHook) {
+            this.unHook = unHook;
+            session.addHook(unHook);
+        }
+
+        @Override
+        public void detach() {
+            if (unHook != null) {
+                unHook.unhook();
+                unHook = null;
+            }
+        }
+    }
+
+    private static final class CountWriteHook implements WriteHook {
+        private final CountMemoryHook delegate;
+        private UnHook unHook;
+
+        private CountWriteHook(CountMemoryHook delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void hook(Backend backend, long address, int size, long value, Object user) {
+            delegate.session.writer().countMemoryAccess("write");
+            delegate.session.stopIfNeeded();
+        }
+
+        @Override
+        public void onAttach(UnHook unHook) {
+            this.unHook = unHook;
+            delegate.session.addHook(unHook);
+        }
+
+        @Override
+        public void detach() {
+            if (unHook != null) {
+                unHook.unhook();
+                unHook = null;
+            }
+        }
     }
 
     private static final class TraceCodeHook implements CodeHook {
